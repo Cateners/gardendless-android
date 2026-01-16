@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Gardendless</string>
+    <string name="unzipping">Extracting files…</string>
+    <string name="export">Export Save File</string>
+    <string name="exit_confirm">Exit game?</string>
+    <string name="yes">Exit</string>
+    <string name="no">Return</string>
+    <string name="hint">Warning</string>
+</resources>
