@@ -218,9 +218,19 @@ class GameActivity : AppCompatActivity() {
                     // 保存回调以便在 onActivityResult 中使用
                     this@GameActivity.filePathCallback = filePathCallback
 
-                    // 启动系统文件选择器
-                    val intent = fileChooserParams?.createIntent()!!.apply {
-                        type = "application/json" // 仅显示 JSON 档案
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+
+                        // 1. 设置主类型为通配符，以便能够显示更多文件
+                        type = "*/*"
+
+                        // 2. 显式指定允许的多种 MIME 类型
+                        val mimeTypes = arrayOf(
+                            "application/json",
+                            "application/octet-stream", // 很多系统把 json5 识别为 bin
+                            "text/plain"               // 有些系统把 json5 识别为纯文本
+                        )
+                        putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
                     }
                     try {
                         startActivityForResult(intent!!, FILE_CHOOSER_RESULT_CODE)
