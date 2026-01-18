@@ -6,4 +6,5 @@
     <string name="yes">Exit</string>
     <string name="no">Return</string>
     <string name="hint">Warning</string>
+    <string name="description">This is an unofficial port. For details, visit: https://github.com/Cateners/gardendless-android</string>
 </resources>

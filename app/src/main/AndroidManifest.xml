@@ -11,13 +11,13 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Gardendless"
-        android:hardwareAccelerated="true" >
+        android:hardwareAccelerated="true"
+        android:appCategory="game" >
         <activity
             android:name=".GameActivity"
             android:exported="true"
-            android:screenOrientation="landscape"
-            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout"
-            android:theme="@style/Theme.AppCompat.NoActionBar">
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

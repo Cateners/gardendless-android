@@ -20,18 +20,18 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.webkit.*
 import android.widget.ProgressBar
 import androidx.activity.OnBackPressedCallback
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewAssetLoader.InternalStoragePathHandler
+import com.google.android.material.color.DynamicColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
@@ -49,6 +49,7 @@ class GameActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DynamicColors.applyToActivityIfAvailable(this)
         setupFullScreen()
 
         fun setupWebview() {
@@ -103,98 +104,125 @@ class GameActivity : AppCompatActivity() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     val js = """
-                            console.log("DEBUG_JS: Injection Started!");
-        function createEvent(event, type, button) {
-            let touches = event.changedTouches,
-                first = touches[0];
-            return new MouseEvent(type, {
+function createEvent(event, type, button) {
+    let touches = event.changedTouches,
+        first = touches[0];
+    return new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        detail: 1,
+        screenX: first.screenX,
+        screenY: first.screenY,
+        clientX: first.clientX,
+        clientY: first.clientY,
+        ctrlKey: false,
+        altKey: false,
+        shiftKey: false,
+        metaKey: false,
+        button: button || 0,
+        relatedTarget: null
+    });
+}
+
+let delay_time = 16;
+let firstX = null;
+let firstY = null;
+let lastY = null;
+
+document.addEventListener("touchstart", (event) => {
+    if (event.touches.length === 3) {
+        const touch1 = event.touches[0];
+        const touch2 = event.touches[1];
+        const touch3 = event.touches[2];
+        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
+        setTimeout(() => {
+            event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown", 2));
+        }, delay_time);
+        setTimeout(() => {
+            event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup", 2));
+        }, delay_time * 2);
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+    }
+    
+    if (event.touches.length === 2) {
+        const touch1 = event.touches[0];
+        const touch2 = event.touches[1];
+        firstX = (touch1.clientX + touch2.clientX) / 2;
+        firstY = (touch1.clientY + touch2.clientY) / 2;
+        lastY = firstY;
+        document.getElementById("GameCanvas").dispatchEvent(new MouseEvent("mousemove", {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            detail: 1,
+            clientX: firstX,
+            clientY: firstY,
+            ctrlKey: false,
+            altKey: false,
+            shiftKey: false,
+            metaKey: false,
+            button: button || 0,
+            relatedTarget: null
+        }));
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+    }
+
+    event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
+    setTimeout(() => {
+        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown"));
+    }, delay_time);
+    event.preventDefault();
+    event.stopPropagation();
+}, true);
+document.addEventListener("touchmove", (event) => {
+
+    if (event.touches.length === 2) {
+        const touch1 = event.touches[0];
+        const touch2 = event.touches[1];
+        const currentY = (touch1.clientY + touch2.clientY) / 2;
+
+        if (lastY !== null) {
+            const deltaY = currentY - lastY;
+            const wheelDelta = deltaY * -1;
+
+            const wheelEvent = new WheelEvent('wheel', {
+                deltaY: wheelDelta,
+                deltaMode: 0,
                 bubbles: true,
-                cancelable: true,
-                view: window,
-                detail: 1,
-                screenX: first.screenX,
-                screenY: first.screenY,
-                clientX: first.clientX,
-                clientY: first.clientY,
-                ctrlKey: false,
-                altKey: false,
-                shiftKey: false,
-                metaKey: false,
-                button: button || 0,
+                clientX: firstX,
+                clientY: firstY,
                 relatedTarget: null
             });
+            document.getElementById("GameCanvas").dispatchEvent(wheelEvent);
         }
-        
-        let delay_time = 16;
-        let lastY = null;
-        
-        document.addEventListener("touchstart", (event) => {
-            if (event.touches.length === 3) {
-                const touch1 = event.touches[0];
-                const touch2 = event.touches[1];
-                const touch3 = event.touches[2];
-                setTimeout(() => {
-                    event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown", 2));
-                }, delay_time);
-                setTimeout(() => {
-                    event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup", 2));
-                }, delay_time * 2);
-            }
-            
-            if (event.touches.length === 2) {
-                const touch1 = event.touches[0];
-                const touch2 = event.touches[1];
-                lastY = (touch1.clientY + touch2.clientY) / 2;
-            }
-        
-            event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
-            setTimeout(() => {
-                event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown"));
-            }, delay_time);
-            event.preventDefault();
-            event.stopPropagation();
-        }, true);
-        document.addEventListener("touchmove", (event) => {
-        
-            if (event.touches.length === 2) {
-                const touch1 = event.touches[0];
-                const touch2 = event.touches[1];
-                const currentY = (touch1.clientY + touch2.clientY) / 2;
-        
-                if (lastY !== null) {
-                    const deltaY = currentY - lastY;
-                    const wheelDelta = deltaY * -3;
-        
-                    const wheelEvent = new WheelEvent('wheel', {
-                        deltaY: wheelDelta,
-                        deltaMode: 0,
-                        bubbles: true,
-                        screenX: (touch1.screenX + touch2.screenX) / 2,
-                        screenY: (touch1.screenY + touch2.screenY) / 2,
-                        clientX: (touch1.clientX + touch2.clientX) / 2,
-                        clientY: currentY,
-                        relatedTarget: null
-                    });
-                    document.getElementById("GameCanvas").dispatchEvent(wheelEvent);
-                }
-                lastY = currentY;
-            }
-        
-            setTimeout(() => {
-                event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
-            }, delay_time);
-            event.preventDefault();
-            event.stopPropagation();
-        }, true);
-        document.addEventListener("touchend", (event) => {
-            lastY = null;
-        
-            setTimeout(() => {
-                event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup"));
-            }, delay_time);
-            event.preventDefault();
-            event.stopPropagation();
-        }, true);
+        lastY = currentY;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+    }
+
+    setTimeout(() => {
+        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
+    }, delay_time);
+    event.preventDefault();
+    event.stopPropagation();
+}, true);
+document.addEventListener("touchend", (event) => {
+  firstX = null;
+  firstY = null;
+  lastY = null;
+
+  setTimeout(() => {
+      event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup"));
+  }, delay_time);
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
                         """.trimIndent()
                     view?.postDelayed({
                         view.evaluateJavascript(js, null)
@@ -256,8 +284,9 @@ class GameActivity : AppCompatActivity() {
                 setPadding(50, 50, 50, 50)
             }
 
-            val dialog = AlertDialog.Builder(this)
+            val dialog = MaterialAlertDialogBuilder(this)
                 .setTitle(R.string.unzipping) // 建议在 strings.xml 定义“正在准备资源...”
+                .setMessage(R.string.description)
                 .setView(progressBar)
                 .setCancelable(false) // 防止解压时用户点击返回键取消
                 .create()
@@ -366,7 +395,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private fun showExitDialog() {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.hint) // 需在 strings.xml 定义
             .setMessage(R.string.exit_confirm)
             .setPositiveButton(R.string.yes) { _, _ -> finish() }

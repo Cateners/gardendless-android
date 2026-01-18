@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Gardendless</string>
-    <string name="unzipping">解压资源…</string>
+    <string name="unzipping">解压资源中…</string>
     <string name="export">导出游戏存档</string>
     <string name="exit_confirm">就这样结束了？</string>
     <string name="yes">是的</string>
     <string name="no">点错了</string>
     <string name="hint">提示</string>
+    <string name="description">这不是官方版本。关于此移植的更多信息，见 https://github.com/Cateners/gardendless-android</string>
 </resources>
