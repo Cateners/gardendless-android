@@ -38,6 +38,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.zip.ZipInputStream
+import androidx.core.net.toUri
 
 class GameActivity : AppCompatActivity() {
 
@@ -72,6 +73,7 @@ class GameActivity : AppCompatActivity() {
                 domStorageEnabled = true // 很多游戏需要存储数据
                 allowFileAccess = false  // 使用 AssetLoader 后可以关闭文件访问，更安全
                 allowContentAccess = false
+                mediaPlaybackRequiresUserGesture = false
             }
 
             webView.setDownloadListener { url, _, _, mimeType, _ ->
@@ -101,128 +103,146 @@ class GameActivity : AppCompatActivity() {
             }
 
             webView.webViewClient = object : WebViewClient() {
+                // 关键：拦截 URL 跳转逻辑
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString() ?: return false
+
+                    // 1. 如果是内部游戏资源路径，允许在 WebView 中加载
+                    if (url.startsWith("https://appassets.androidplatform.net/")) {
+                        return false
+                    }
+
+                    // 2. 如果是外部链接，跳转到外部浏览器
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+                        startActivity(intent)
+                        return true // 表示我们已经处理了该跳转
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        return false
+                    }
+                }
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     val js = """
-function createEvent(event, type, button) {
-    let touches = event.changedTouches,
-        first = touches[0];
-    return new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        detail: 1,
-        screenX: first.screenX,
-        screenY: first.screenY,
-        clientX: first.clientX,
-        clientY: first.clientY,
-        ctrlKey: false,
-        altKey: false,
-        shiftKey: false,
-        metaKey: false,
-        button: button || 0,
-        relatedTarget: null
-    });
-}
+(function() {
+    const target = document.getElementById("GameCanvas");
+    if (!target) return;
 
-let delay_time = 16;
-let firstX = null;
-let firstY = null;
-let lastY = null;
+    let maxTouches = 0;
+    let isDragging = false;
+    let lastWheelY = 0;
+    let touchStartCenter = null;
+    let delayTime = 24;
 
-document.addEventListener("touchstart", (event) => {
-    if (event.touches.length === 3) {
-        const touch1 = event.touches[0];
-        const touch2 = event.touches[1];
-        const touch3 = event.touches[2];
-        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
-        setTimeout(() => {
-            event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown", 2));
-        }, delay_time);
-        setTimeout(() => {
-            event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup", 2));
-        }, delay_time * 2);
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-    }
-    
-    if (event.touches.length === 2) {
-        const touch1 = event.touches[0];
-        const touch2 = event.touches[1];
-        firstX = (touch1.clientX + touch2.clientX) / 2;
-        firstY = (touch1.clientY + touch2.clientY) / 2;
-        lastY = firstY;
-        document.getElementById("GameCanvas").dispatchEvent(new MouseEvent("mousemove", {
+    // --- 新增：用于区分滚动和右键的变量 ---
+    let hasMovedEnough = false;
+    const moveThreshold = 10; // 移动超过10像素才触发滚动
+
+    function emitMouseEvent(type, coords, button = 0) {
+        const mouseEvent = new MouseEvent(type, {
             bubbles: true,
             cancelable: true,
             view: window,
-            detail: 1,
-            clientX: firstX,
-            clientY: firstY,
-            ctrlKey: false,
-            altKey: false,
-            shiftKey: false,
-            metaKey: false,
-            button: button || 0,
-            relatedTarget: null
+            clientX: coords.clientX,
+            clientY: coords.clientY,
+            button: button,
+            buttons: button === 0 ? 1 : (button === 2 ? 2 : 0)
+        });
+        target.dispatchEvent(mouseEvent);
+    }
+
+    function emitWheelEvent(coords, deltaY) {
+        target.dispatchEvent(new WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: coords.clientX,
+            clientY: coords.clientY,
+            deltaY: deltaY,
+            deltaMode: 0
         }));
-        event.preventDefault();
-        event.stopPropagation();
-        return;
     }
 
-    event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
-    setTimeout(() => {
-        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousedown"));
-    }, delay_time);
-    event.preventDefault();
-    event.stopPropagation();
-}, true);
-document.addEventListener("touchmove", (event) => {
+    function getCenter(t1, t2) {
+        return {
+            clientX: (t1.clientX + (t2?.clientX || t1.clientX)) / 2,
+            clientY: (t1.clientY + (t2?.clientY || t1.clientY)) / 2
+        };
+    }
 
-    if (event.touches.length === 2) {
-        const touch1 = event.touches[0];
-        const touch2 = event.touches[1];
-        const currentY = (touch1.clientY + touch2.clientY) / 2;
+    document.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const count = e.touches.length;
+        if (count > maxTouches) maxTouches = count;
 
-        if (lastY !== null) {
-            const deltaY = currentY - lastY;
-            const wheelDelta = deltaY * -1;
+        if (count === 1) {
+            emitMouseEvent("mousemove", e.touches[0], 0);
+            setTimeout(() => {
+                emitMouseEvent("mousedown", e.touches[0], 0);
+            }, delayTime)
+            isDragging = true;
+        } else if (count === 2) {
+            touchStartCenter = getCenter(e.touches[0], e.touches[1]);
+            lastWheelY = touchStartCenter.clientY;
+            hasMovedEnough = false; // 重置移动判定
 
-            const wheelEvent = new WheelEvent('wheel', {
-                deltaY: wheelDelta,
-                deltaMode: 0,
-                bubbles: true,
-                clientX: firstX,
-                clientY: firstY,
-                relatedTarget: null
-            });
-            document.getElementById("GameCanvas").dispatchEvent(wheelEvent);
+            emitMouseEvent("mousemove", touchStartCenter, 0);
+            if (isDragging) {
+                isDragging = false;
+            }
         }
-        lastY = currentY;
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-    }
+    }, { capture: true, passive: false });
 
-    setTimeout(() => {
-        event.changedTouches[0].target.dispatchEvent(createEvent(event, "mousemove"));
-    }, delay_time);
-    event.preventDefault();
-    event.stopPropagation();
-}, true);
-document.addEventListener("touchend", (event) => {
-  firstX = null;
-  firstY = null;
-  lastY = null;
+    document.addEventListener("touchmove", (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
 
-  setTimeout(() => {
-      event.changedTouches[0].target.dispatchEvent(createEvent(event, "mouseup"));
-  }, delay_time);
-  event.preventDefault();
-  event.stopPropagation();
-}, true);
+        if (e.touches.length === 1 && isDragging) {
+            setTimeout(() => {
+                emitMouseEvent("mousemove", e.touches[0], 0);
+            }, delayTime)
+        } else if (e.touches.length === 2) {
+            const currentCenter = getCenter(e.touches[0], e.touches[1]);
+            const deltaYTotal = Math.abs(currentCenter.clientY - touchStartCenter.clientY);
+
+            // 只有当移动距离超过阈值，才触发滚轮
+            if (hasMovedEnough || deltaYTotal > moveThreshold) {
+                hasMovedEnough = true;
+                const deltaY = lastWheelY - currentCenter.clientY;
+                emitWheelEvent(touchStartCenter, deltaY * 2);
+                lastWheelY = currentCenter.clientY;
+            }
+        }
+    }, { capture: true, passive: false });
+
+    document.addEventListener("touchend", (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+
+        if (maxTouches === 1) {
+            setTimeout(() => {
+                emitMouseEvent("mouseup", e.changedTouches[0], 0);
+            }, delayTime);
+        }
+        // 只有当没有触发过滚动（hasMovedEnough 为 false）时，才触发右键
+        else if (maxTouches === 2 && e.touches.length === 0 && !hasMovedEnough) {
+            const finalCenter = touchStartCenter || getCenter(e.changedTouches[0], e.changedTouches[1]);
+            emitMouseEvent("mousemove", finalCenter, 0);
+            emitMouseEvent("mousedown", finalCenter, 2);
+            emitMouseEvent("mouseup", finalCenter, 2);
+        }
+
+        if (e.touches.length === 0) {
+            maxTouches = 0;
+            isDragging = false;
+            touchStartCenter = null;
+            hasMovedEnough = false; // 重置状态
+        }
+    }, { capture: true, passive: false });
+
+})();
                         """.trimIndent()
                     view?.postDelayed({
                         view.evaluateJavascript(js, null)
@@ -357,8 +377,10 @@ document.addEventListener("touchend", (event) => {
         // 隐藏 ActionBar (如果在 Manifest 中没设主题，这里是双保险)
         supportActionBar?.hide()
 
-        window.attributes.layoutInDisplayCutoutMode =
-            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Android 11 (API 30) 及以上

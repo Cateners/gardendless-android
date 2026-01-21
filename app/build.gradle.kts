@@ -20,7 +20,7 @@ android {
 
     defaultConfig {
         applicationId = "com.fct.gardendless"
-        minSdk = 28
+        minSdk = 27
         targetSdk = 36
         versionCode = 2
         versionName = "0.6.5"

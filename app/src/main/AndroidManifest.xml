@@ -17,7 +17,7 @@
             android:name=".GameActivity"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
-            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout">
+            android:configChanges="uiMode|orientation|screenSize|keyboard|keyboardHidden|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
