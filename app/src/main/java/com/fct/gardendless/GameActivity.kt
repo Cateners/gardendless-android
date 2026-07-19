@@ -55,25 +55,36 @@ class GameActivity : AppCompatActivity() {
 
         fun setupWebview() {
 
-            // 2. 初始化 WebView
+// 2. 初始化 WebView
             webView = MouseGameWebView(this)
-            
-            // 创建一个黑色背景的容器，重写测量逻辑强制子 View 保持 16:9
+
+            // 创建一个黑色背景的容器，重写测量逻辑实现比例动态适配（最小16:10，最大17:9）
             val container = object : android.widget.FrameLayout(this) {
                 override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
                     super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+
+                    // 防空保护：确保有子 View 才进行自定义测量
+                    if (childCount == 0) return
+
                     val screenWidth = measuredWidth
                     val screenHeight = measuredHeight
 
                     var targetWidth = screenWidth
                     var targetHeight = screenHeight
 
-                    if (screenWidth * 9 > screenHeight * 16) {
-                        // 屏幕更宽 (例如 20:9)，以高度为基准计算宽度，左右留黑边
-                        targetWidth = screenHeight * 16 / 9
+                    if (screenWidth * 90 > screenHeight * 171) {
+                        // 1. 屏幕【太宽】了：超过了 17:9 (例如 20:9, 21:9 手机)
+                        // 此时以高度为基准，宽度强行卡死在 17:9，左右留黑边
+                        targetWidth = screenHeight * 171 / 90
+                    } else if (screenWidth * 100 < screenHeight * 160) {
+                        // 2. 屏幕【太方/太高】了：窄于 16:10 (例如 4:3 或 7:5 平板)
+                        // 此时以宽度为基准，高度强行卡死在 16:10，上下留黑边
+                        targetHeight = screenWidth * 100 / 160
                     } else {
-                        // 屏幕更方 (例如 7:5)，以宽度为基准计算高度，上下留黑边
-                        targetHeight = screenWidth * 9 / 16
+                        // 屏幕比例在 16:10 到 17:9 之间
+                        // 全屏铺满
+                        targetWidth = screenWidth
+                        targetHeight = screenHeight
                     }
 
                     // 强制指定子 View (WebView) 的精确测量尺寸
