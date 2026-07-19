@@ -1,0 +1,273 @@
+name: Build release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build latest Gardendless game
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      UPSTREAM_REPOSITORY: Gzh0821/pvzge_web
+      UPSTREAM_BRANCH: master
+      ANDROID_BUILD_TOOLS_VERSION: 35.0.0
+
+    steps:
+      - name: Check out Android project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager_path="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "${sdkmanager_path}" ]]; then
+            echo "sdkmanager not found or not executable: ${sdkmanager_path}" >&2
+            exit 1
+          fi
+
+          "${sdkmanager_path}" \
+            --sdk_root="${ANDROID_HOME}" \
+            "platforms;android-36" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+
+      - name: Download and prepare latest game archive
+        id: game
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_sha="$(
+            git ls-remote \
+              "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+              "refs/heads/${UPSTREAM_BRANCH}" \
+              | awk '{print $1}'
+          )"
+          if [[ ! "${upstream_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unable to resolve ${UPSTREAM_REPOSITORY}@${UPSTREAM_BRANCH}" >&2
+            exit 1
+          fi
+
+          work_dir="$(mktemp -d)"
+          archive_path="${work_dir}/upstream.zip"
+          extracted_dir="${work_dir}/extracted"
+          normalized_dir="${work_dir}/normalized"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --output "${archive_path}" \
+            "https://codeload.github.com/${UPSTREAM_REPOSITORY}/zip/${upstream_sha}"
+
+          mkdir -p "${extracted_dir}"
+          unzip -q "${archive_path}" -d "${extracted_dir}"
+          mapfile -t extracted_roots < <(
+            find "${extracted_dir}" -mindepth 1 -maxdepth 1 -type d -print
+          )
+          if (( ${#extracted_roots[@]} != 1 )); then
+            echo "Expected exactly one root directory in the upstream archive" >&2
+            exit 1
+          fi
+          source_dir="${extracted_roots[0]}"
+          index_path="${source_dir}/docs/index.html"
+          if [[ ! -f "${index_path}" ]]; then
+            echo "Expected game entry point is missing: ${index_path}" >&2
+            exit 1
+          fi
+
+          game_version="$(python3 - "${index_path}" <<'PY'
+          import re
+          import sys
+          from html.parser import HTMLParser
+
+          class TitleParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.in_title = False
+                  self.parts = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "title":
+                      self.in_title = True
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "title":
+                      self.in_title = False
+
+              def handle_data(self, data):
+                  if self.in_title:
+                      self.parts.append(data)
+
+          parser = TitleParser()
+          with open(sys.argv[1], encoding="utf-8") as index_file:
+              parser.feed(index_file.read())
+
+          title = " ".join("".join(parser.parts).split())
+          match = re.fullmatch(r".+\|\s*([0-9]+(?:\.[0-9]+){2})", title)
+          if match is None:
+              raise SystemExit(f"Unable to extract x.y.z game version from title: {title!r}")
+          print(match.group(1))
+          PY
+          )"
+
+          version_code=$((100000 + GITHUB_RUN_NUMBER))
+          if (( version_code > 2100000000 )); then
+            echo "Generated versionCode exceeds Android's supported range: ${version_code}" >&2
+            exit 1
+          fi
+
+          mkdir -p "${normalized_dir}" app/src/main/assets
+          mv "${source_dir}" "${normalized_dir}/pvzge_web-master"
+          (
+            cd "${normalized_dir}"
+            zip -q -r \
+              "${GITHUB_WORKSPACE}/app/src/main/assets/pvzge_web-master.zip" \
+              pvzge_web-master
+          )
+
+          game_archive="app/src/main/assets/pvzge_web-master.zip"
+          unzip -tq "${game_archive}"
+          unzip -Z1 "${game_archive}" \
+            | grep -Fx 'pvzge_web-master/docs/index.html' > /dev/null
+
+          echo "game_version=${game_version}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+          echo "version_code=${version_code}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=gardendless-android-${game_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build signed release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash gradlew :app:assembleRelease \
+            --no-daemon \
+            -PversionNameOverride="${{ steps.game.outputs.game_version }}" \
+            -PversionCodeOverride="${{ steps.game.outputs.version_code }}"
+
+      - name: Verify and package APK
+        id: package
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.game.outputs.artifact_name }}
+          EXPECTED_VERSION_NAME: ${{ steps.game.outputs.game_version }}
+          EXPECTED_VERSION_CODE: ${{ steps.game.outputs.version_code }}
+          UPSTREAM_SHA: ${{ steps.game.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          source_apk="app/build/outputs/apk/release/app-release.apk"
+          output_dir="dist"
+          output_apk="${output_dir}/${ARTIFACT_NAME}.apk"
+          if [[ ! -f "${source_apk}" ]]; then
+            echo "Release APK was not generated: ${source_apk}" >&2
+            exit 1
+          fi
+
+          mkdir -p "${output_dir}"
+          cp "${source_apk}" "${output_apk}"
+
+          apksigner_path="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/apksigner"
+          "${apksigner_path}" verify --verbose "${output_apk}"
+
+          apkanalyzer_path="${ANDROID_HOME}/cmdline-tools/latest/bin/apkanalyzer"
+          if [[ ! -x "${apkanalyzer_path}" ]]; then
+            echo "apkanalyzer not found or not executable: ${apkanalyzer_path}" >&2
+            exit 1
+          fi
+
+          actual_version_name="$("${apkanalyzer_path}" manifest version-name "${output_apk}")"
+          actual_version_code="$("${apkanalyzer_path}" manifest version-code "${output_apk}")"
+          if [[ "${actual_version_name}" != "${EXPECTED_VERSION_NAME}" ]]; then
+            echo "Unexpected versionName: ${actual_version_name}" >&2
+            exit 1
+          fi
+          if [[ "${actual_version_code}" != "${EXPECTED_VERSION_CODE}" ]]; then
+            echo "Unexpected versionCode: ${actual_version_code}" >&2
+            exit 1
+          fi
+
+          unzip -Z1 "${output_apk}" \
+            | grep -Fx 'assets/pvzge_web-master.zip' > /dev/null
+
+          apk_sha256="$(sha256sum "${output_apk}" | awk '{print $1}')"
+          apk_size="$(stat --format='%s' "${output_apk}")"
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          {
+            echo "Game version: ${EXPECTED_VERSION_NAME}"
+            echo "Android versionCode: ${EXPECTED_VERSION_CODE}"
+            echo "Upstream repository: ${UPSTREAM_REPOSITORY}"
+            echo "Upstream commit: ${UPSTREAM_SHA}"
+            echo "Android repository: ${GITHUB_REPOSITORY}"
+            echo "Android commit: ${GITHUB_SHA}"
+            echo "Workflow run: ${run_url}"
+            echo "APK filename: ${ARTIFACT_NAME}.apk"
+            echo "APK size (bytes): ${apk_size}"
+            echo "APK SHA-256: ${apk_sha256}"
+          } > "${output_dir}/build-info.txt"
+
+          echo "apk_sha256=${apk_sha256}" >> "${GITHUB_OUTPUT}"
+          echo "apk_size=${apk_size}" >> "${GITHUB_OUTPUT}"
+          echo "run_url=${run_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.game.outputs.artifact_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+
+      - name: Write build summary
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.game.outputs.artifact_name }}
+          GAME_VERSION: ${{ steps.game.outputs.game_version }}
+          VERSION_CODE: ${{ steps.game.outputs.version_code }}
+          UPSTREAM_SHA: ${{ steps.game.outputs.upstream_sha }}
+          APK_SHA256: ${{ steps.package.outputs.apk_sha256 }}
+          APK_SIZE: ${{ steps.package.outputs.apk_size }}
+          RUN_URL: ${{ steps.package.outputs.run_url }}
+        run: |
+          {
+            echo "## Release APK build"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Artifact | \`${ARTIFACT_NAME}\` |"
+            echo "| APK | \`${ARTIFACT_NAME}.apk\` |"
+            echo "| Game version | \`${GAME_VERSION}\` |"
+            echo "| Android versionCode | \`${VERSION_CODE}\` |"
+            echo "| Upstream commit | \`${UPSTREAM_SHA}\` |"
+            echo "| Android commit | \`${GITHUB_SHA}\` |"
+            echo "| APK size | \`${APK_SIZE}\` bytes |"
+            echo "| APK SHA-256 | \`${APK_SHA256}\` |"
+            echo "| Workflow run | ${RUN_URL} |"
+          } >> "${GITHUB_STEP_SUMMARY}"

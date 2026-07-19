@@ -12,6 +12,16 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
+val versionCodeOverride = providers.gradleProperty("versionCodeOverride").orNull?.let { value ->
+    val parsedValue = value.toIntOrNull()
+        ?: error("versionCodeOverride must be a positive integer, but was: $value")
+    require(parsedValue > 0) { "versionCodeOverride must be positive, but was: $value" }
+    parsedValue
+}
+val versionNameOverride = providers.gradleProperty("versionNameOverride").orNull?.also { value ->
+    require(value.isNotBlank()) { "versionNameOverride must not be blank" }
+}
+
 android {
     namespace = "com.fct.gardendless"
     compileSdk {
@@ -22,8 +32,8 @@ android {
         applicationId = "com.fct.gardendless"
         minSdk = 27
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.10.0"
+        versionCode = versionCodeOverride ?: 8
+        versionName = versionNameOverride ?: "0.10.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
