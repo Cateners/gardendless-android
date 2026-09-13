@@ -1,7 +1,15 @@
 <resources>
     <string name="app_name">Gardendless</string>
     <string name="unzipping">Extracting files…</string>
-    <string name="export">Export Save File</string>
+    <string name="export_done">Exported</string>
+    <string name="export_failed">Export failed</string>
+
+    <!-- Documents Provider -->
+    <string name="documents_root_title">Gardendless</string>
+    <string name="documents_root_summary">Game files</string>
+    <string name="documents_error_delete_root">Cannot delete the game directory itself</string>
+    <string name="documents_error_target_exists">A file with that name already exists</string>
+    <string name="documents_error_rename_failed">Rename failed</string>
     <string name="exit_confirm">Exit game?</string>
     <string name="yes">Exit</string>
     <string name="no">Return</string>

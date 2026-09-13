@@ -16,6 +16,11 @@
 # debugging stack traces.
 #-keepattributes SourceFile,LineNumberTable
 
+# WebView JS 桥（全屏意图转发），release 混淆后必须保留，否则全屏功能静默失效
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
