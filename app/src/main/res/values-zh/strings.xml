@@ -8,6 +8,9 @@
     <!-- Documents Provider -->
     <string name="documents_root_title">Gardendless</string>
     <string name="documents_root_summary">游戏文件</string>
+    <string name="documents_gpnext_root_title">GP-Next</string>
+    <string name="documents_gpnext_root_summary">数据包与 JS 模组</string>
+    <string name="documents_open_failed">没有可用的文件管理器</string>
     <string name="documents_error_delete_root">不能删除游戏目录本身</string>
     <string name="documents_error_target_exists">已存在同名文件</string>
     <string name="documents_error_rename_failed">重命名失败</string>

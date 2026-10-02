@@ -19,6 +19,11 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.system.Os
+import android.system.OsConstants
+import android.util.Base64
+import android.util.Log
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -40,6 +45,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.zip.ZipInputStream
 import androidx.core.net.toUri
+import org.json.JSONArray
+import org.json.JSONObject
 
 class GameActivity : AppCompatActivity() {
 
@@ -47,6 +54,27 @@ class GameActivity : AppCompatActivity() {
     private lateinit var aspectContainer: AspectRatioFrameLayout
 
     private val prefs by lazy { getSharedPreferences("app_data", MODE_PRIVATE) }
+
+    /**
+     * gp-next 数据目录，对应 Tauri 的 AppData 根。
+     * 游戏会把 plugin:path|resolve_directory 的返回值拼上 `/gp-next`，
+     * 因此数据实际位于 filesDir/gp-next，与 GameDocumentsProvider 的 gpnext 根指向同一目录。
+     */
+    private val gpNextDir: File by lazy { File(filesDir, GP_NEXT_DIR_NAME).apply { mkdirs() } }
+
+    /**
+     * 注入页面的 Tauri shim（assets/gdnext-shim.js）。
+     * 前置的 window.__gdForceJsModding 供 shim 决定是否自动启用 JS Modding，见 [FORCE_JS_MODDING]。
+     */
+    private val gpNextShimJs: String by lazy {
+        val js = runCatching {
+            assets.open(SHIM_ASSET).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrElse { e ->
+            Log.e(TAG, "无法读取 $SHIM_ASSET，gp-next 的数据包与 JS 模组将不可用", e)
+            ""
+        }
+        if (js.isEmpty()) js else "window.__gdForceJsModding=$FORCE_JS_MODDING;\n$js"
+    }
 
     private val FILE_CHOOSER_RESULT_CODE = 101
     private val EXPORT_SAVE_RESULT_CODE = 102
@@ -63,6 +91,20 @@ class GameActivity : AppCompatActivity() {
 
     private companion object {
         const val PREF_FULLSCREEN = "webview_fullscreen"
+        const val TAG = "Gardendless"
+        const val SHIM_ASSET = "gdnext-shim.js"
+        const val GP_NEXT_DIR_NAME = "gp-next"
+
+        /**
+         * 是否在启动时自动启用 gp-next 的 JS Modding 开关。
+         *
+         * 该开关默认关闭，且游戏「实验性」页中的对应开关处于锁定状态（pointer-events:none，
+         * 回调会把 true 还原为 false），唯一入口是控制台的 window.gpNext.mods.enableJsModding()。
+         * 移植版没有可用的控制台，因此由 gdnext-shim.js 代为调用一次。
+         *
+         * 置为 false 可恢复原行为（需手动从 devtools 开启）。
+         */
+        const val FORCE_JS_MODDING = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,12 +112,11 @@ class GameActivity : AppCompatActivity() {
         DynamicColors.applyToActivityIfAvailable(this)
         setupFullScreen()
 
+        /** 装配 WebView、AssetLoader、JS 桥与各回调，并加载游戏入口页 */
         fun setupWebview() {
-
-// 2. 初始化 WebView
             webView = MouseGameWebView(this)
 
-            // 黑色背景容器，重写测量逻辑实现比例动态适配（最小16:10，最大17:9）
+            // 黑底容器，负责 16:10 ~ 17:9 的比例适配与全屏切换
             aspectContainer = AspectRatioFrameLayout(this).apply {
                 setBackgroundColor(android.graphics.Color.BLACK)
                 // 沿用上次退出时的全屏状态，避免先小后大的尺寸跳变
@@ -93,27 +134,44 @@ class GameActivity : AppCompatActivity() {
             // 将容器设置为 Content View
             setContentView(aspectContainer)
 
-            // 3. 配置 AssetLoader (关键步骤)
+            // AssetLoader 把 https://appassets.androidplatform.net/ 映射到本地目录。
+            //
+            // /gp-next/ 供 shim 读取 gp-next 数据：shim 中的 plugin:fs|read_text_file 与 read_file
+            // 通过 fetch 该虚拟路径获取流式的原始字节，无需经 JS 桥传送 base64。
+            // gpNextDir 的懒初始化会先确保目录存在，否则该路径下的请求全部 404。
+            //
+            // 注册顺序不可调整：WebViewAssetLoader 按注册顺序遍历 handler，返回第一个非 null 的响应；
+            // 而 "/" 能匹配任意路径，且 InternalStoragePathHandler 在文件不存在时返回的是 404 空响应
+            // （并非 null），因此 "/" 若排在前面会拦截 /gp-next/ 的请求，表现为到 docs 目录下查找
+            // gp-next/... 并输出 "Error opening the requested path"。
+            // 依据：androidx.webkit 1.15.0 的 WebViewAssetLoader.shouldInterceptRequest 与
+            // Builder.addPathHandler。
             val assetLoader = WebViewAssetLoader.Builder()
                 .setDomain("appassets.androidplatform.net")
+                .addPathHandler(
+                    "/$GP_NEXT_DIR_NAME/",
+                    InternalStoragePathHandler(this, gpNextDir)
+                )
                 .addPathHandler(
                     "/",
                     InternalStoragePathHandler(this, File(filesDir, "pvzge_web-master/docs"))
                 )
                 .build()
 
-            // 4. 设置 WebView 参数
             webView.settings.apply {
                 javaScriptEnabled = true
-                domStorageEnabled = true // 很多游戏需要存储数据
-                allowFileAccess = false  // 使用 AssetLoader 后可以关闭文件访问，更安全
+                // 游戏与 gp-next 的设置都依赖 localStorage
+                domStorageEnabled = true
+                // 资源统一经 AssetLoader 提供，文件与 content 访问保持关闭
+                allowFileAccess = false
                 allowContentAccess = false
                 mediaPlaybackRequiresUserGesture = false
             }
 
-            // 网页 → 原生桥接：游戏跑在 Tauri polyfill 上，全屏和保存文件名这两件事
-            // 在 WebView 里都会丢失（前者被实现为空函数，后者用 prompt 实现而 WebView 不响应），
-            // 故在 JS 层截获意图后经此桥转发
+            // 网页到原生的桥。游戏运行在 Tauri polyfill 之上，其中两件事在 WebView 里会失效：
+            // 全屏被实现为空函数；保存文件名使用 prompt 而 WebView 不响应。
+            // 因此由 JS 层截获意图后经此桥转发。其余方法面向 gp-next 数据目录的读写，
+            // 由 assets/gdnext-shim.js 调用。
             webView.addJavascriptInterface(object {
                 @JavascriptInterface
                 fun setFullscreen(value: Boolean) {
@@ -124,17 +182,65 @@ class GameActivity : AppCompatActivity() {
                 fun setExportName(name: String) {
                     pendingExportName = name
                 }
+
+                // ── gp-next 数据目录（Tauri plugin:path / plugin:fs 的落地实现）──
+
+                /** plugin:path|resolve_directory(14)：返回 AppData 根，游戏会自行拼上 /gp-next */
+                @JavascriptInterface
+                fun appDataRoot(): String = filesDir.absolutePath
+
+                /** plugin:fs|read_dir：返回 [{name, isFile, isDirectory, isSymlink}] 形式的 JSON */
+                @JavascriptInterface
+                fun fsReadDir(rel: String): String = gpNextReadDir(rel)
+
+                /**
+                 * plugin:fs|stat 与 plugin:fs|lstat。
+                 * dist-js 会把返回值直接映射为 FileInfo（首个字段即 isFile），
+                 * 因此路径不存在时返回 null 交由调用方转成 reject，其余字段不可缺失。
+                 */
+                @JavascriptInterface
+                fun fsStat(rel: String): String? = gpNextStatJson(rel)
+
+                /** plugin:fs|rename（新版 dist-js 新增的命令） */
+                @JavascriptInterface
+                fun fsRename(oldRel: String, newRel: String): Boolean = gpNextRename(oldRel, newRel)
+
+                /** plugin:fs|write_file（新版 dist-js 新增的命令），内容以 base64 传入 */
+                @JavascriptInterface
+                fun fsWriteBytes(rel: String, base64: String): Boolean = gpNextWriteBytes(rel, base64)
+
+                /** plugin:fs|exists */
+                @JavascriptInterface
+                fun fsExists(rel: String): Boolean = gpNextFile(rel).exists()
+
+                /** plugin:fs|mkdir */
+                @JavascriptInterface
+                fun fsMkdir(rel: String): Boolean = gpNextMkdir(rel)
+
+                /** plugin:fs|write_text_file */
+                @JavascriptInterface
+                fun fsWriteText(rel: String, text: String): Boolean = gpNextWriteText(rel, text)
+
+                /** plugin:fs|remove */
+                @JavascriptInterface
+                fun fsRemove(rel: String): Boolean = gpNextRemove(rel)
+
+                /** plugin:opener|open_path：以系统文件管理器打开 gp-next 数据目录 */
+                @JavascriptInterface
+                fun openDataFolder() {
+                    webView.post { openGpNextFolder() }
+                }
             }, "GardendlessBridge")
 
             webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
                 if (!url.startsWith("data:")) return@setDownloadListener
 
-                // 1. 解析 Data URI（格式通常为 data:application/json;base64,XXXXX）
+                // 解析 Data URI（形如 data:application/json;base64,XXXXX）
                 val parts = url.split(",")
                 if (parts.size < 2) return@setDownloadListener
                 pendingExport = Uri.decode(parts.subList(1, parts.size).joinToString(",")).toByteArray()
 
-                // 2. 交给系统保存对话框，由用户决定位置和文件名
+                // 交由系统保存对话框决定位置与文件名
                 val fallbackType = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
                 val name = pendingExportName ?: suggestFileName(contentDisposition, fallbackType)
                 pendingExportName = null
@@ -150,28 +256,32 @@ class GameActivity : AppCompatActivity() {
             }
 
             webView.webViewClient = object : WebViewClient() {
-                // 关键：拦截 URL 跳转逻辑
+                /** 内部资源留在 WebView 中加载，外部链接交给系统浏览器 */
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                     val url = request?.url?.toString() ?: return false
 
-                    // 1. 如果是内部游戏资源路径，允许在 WebView 中加载
                     if (url.startsWith("https://appassets.androidplatform.net/")) {
                         return false
                     }
 
-                    // 2. 如果是外部链接，跳转到外部浏览器
                     try {
                         val intent = Intent(Intent.ACTION_VIEW, url.toUri())
                         startActivity(intent)
-                        return true // 表示我们已经处理了该跳转
+                        // 已由原生处理，阻止 WebView 继续加载
+                        return true
                     } catch (e: Exception) {
                         e.printStackTrace()
                         return false
                     }
                 }
+                /**
+                 * 注入 gp-next shim，并在游戏启动后屏蔽 GameCanvas 上的触摸事件
+                 * （触摸手势统一由 MouseGameWebView 转换为鼠标事件处理）。
+                 * 页面每次加载都会重新注入，shim 内部以 __gdHooked 保证幂等。
+                 */
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    view?.evaluateJavascript(gameBridgeHookJs, null)
+                    if (gpNextShimJs.isNotEmpty()) view?.evaluateJavascript(gpNextShimJs, null)
                     val js = """
 (function() {
     const target = document.getElementById("GameCanvas");
@@ -191,6 +301,7 @@ class GameActivity : AppCompatActivity() {
     }, { capture: true, passive: false });
 })();
                         """.trimIndent()
+                    // 延迟到 GameCanvas 创建完成后再挂载监听
                     view?.postDelayed({
                         view.evaluateJavascript(js, null)
                     }, 8000)
@@ -200,7 +311,7 @@ class GameActivity : AppCompatActivity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): WebResourceResponse? {
-                    // 拦截并交给 AssetLoader 处理
+                    // 交由 AssetLoader 解析（游戏资源与 /gp-next/ 虚拟路径）
                     return assetLoader.shouldInterceptRequest(request.url)
                 }
             }
@@ -216,14 +327,14 @@ class GameActivity : AppCompatActivity() {
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
 
-                        // 1. 设置主类型为通配符，以便能够显示更多文件
+                        // 主类型放宽为通配符，使选择器能显示更多文件
                         type = "*/*"
 
-                        // 2. 显式指定允许的多种 MIME 类型
+                        // 显式补充类型：各系统对 .json5 的识别结果不一致
                         val mimeTypes = arrayOf(
                             "application/json",
-                            "application/octet-stream", // 很多系统把 json5 识别为 bin
-                            "text/plain"               // 有些系统把 json5 识别为纯文本
+                            "application/octet-stream", // 部分系统识别为二进制
+                            "text/plain"                // 部分系统识别为纯文本
                         )
                         putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
                     }
@@ -257,30 +368,31 @@ class GameActivity : AppCompatActivity() {
                 }
             }
 
-            // 5. 加载入口文件
-            // 映射关系：https://appassets.androidplatform.net/ -> gameDir/
+            // 加载入口页：https://appassets.androidplatform.net/ 已映射到游戏 docs 目录
             webView.loadUrl("https://appassets.androidplatform.net/index.html")
 
             setupBackNavigation()
         }
 
+        /** 首次安装或版本号变化时，把 assets 中的游戏包解压到 filesDir */
         fun checkAndExtractAssets(currentVersion: Int) {
-            // 1. 创建一个简单的进度对话框
             val progressBar = ProgressBar(this).apply {
-                isIndeterminate = true // 设置为不确定模式（循环转圈）
+                // 解压总时长不可预知，使用不确定模式
+                isIndeterminate = true
                 setPadding(50, 50, 50, 50)
             }
 
             val dialog = MaterialAlertDialogBuilder(this)
-                .setTitle(R.string.unzipping) // 建议在 strings.xml 定义“正在准备资源...”
+                .setTitle(R.string.unzipping)
                 .setMessage(R.string.description)
                 .setView(progressBar)
-                .setCancelable(false) // 防止解压时用户点击返回键取消
+                // 解压期间不可取消，避免留下不完整的目录
+                .setCancelable(false)
                 .create()
 
             dialog.show()
 
-            // 2. 开启协程/后台线程处理 IO
+            // 解压在 IO 线程执行，完成后再回主线程启动 WebView
             GlobalScope.launch(Dispatchers.IO) {
                 try {
                     assets.open("pvzge_web-master.zip").use { inputStream ->
@@ -299,13 +411,12 @@ class GameActivity : AppCompatActivity() {
                         }
                     }
 
-                    // 写入版本号
+                    // 记录已解压版本，后续启动可直接跳过解压
                     prefs.edit().putInt("extracted_version", currentVersion).apply()
 
-                    // 3. 回到主线程关闭对话框并加载游戏
                     withContext(Dispatchers.Main) {
                         dialog.dismiss()
-                        setupWebview() // 将你原来的 WebView 初始化逻辑封装成此函数
+                        setupWebview()
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -316,9 +427,7 @@ class GameActivity : AppCompatActivity() {
             }
         }
 
-
-
-        // 1. 准备路径
+        // 游戏包版本变化（含首次安装）时重新解压
         val currentVersion = packageManager.getPackageInfo(packageName, 0).versionCode
 
         if (prefs.getInt("extracted_version", 0) != currentVersion) {
@@ -335,7 +444,7 @@ class GameActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // 在 Activity 中处理选择结果
+    /** 接收文件选择与导出保存两处 startActivityForResult 的结果 */
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
@@ -371,7 +480,8 @@ class GameActivity : AppCompatActivity() {
     }
 
     /**
-     * 保存对话框默认名的兜底：游戏通常已通过 Tauri dialog.save 给出文件名（见 [gameBridgeHookJs]），
+     * 保存对话框默认名的兜底：游戏用 `<a download="名字" href="data:...">` 触发导出时，
+     * 文件名会被 assets/gdnext-shim.js 截获并经桥转发过来（setExportName），
      * 取不到时才退回 contentDisposition 的建议名，再取不到才按类型和时间生成。
      */
     private fun suggestFileName(contentDisposition: String?, mimeType: String): String {
@@ -400,8 +510,9 @@ class GameActivity : AppCompatActivity() {
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase())
     }
 
+    /** 沉浸式全屏：隐藏状态栏与导航栏、允许刘海区域，并保持屏幕常亮 */
     private fun setupFullScreen() {
-        // 隐藏 ActionBar (如果在 Manifest 中没设主题，这里是双保险)
+        // 兜底隐藏 ActionBar
         supportActionBar?.hide()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -431,103 +542,137 @@ class GameActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
+    // ── gp-next 数据目录 I/O ──
+    // 以下方法的调用方是 assets/gdnext-shim.js：它把游戏发出的 plugin:fs|* 命令路由到这里。
+    // 传入的路径为相对 AppData 的路径，例如 gp-next\packs\Foo\pack.json。
+
     /**
-     * 注入页面的钩子。
-     *
-     * 游戏跑在 Tauri polyfill 上，有两件事在 WebView 里会丢失：
-     * - 全屏：polyfill 把 `plugin:window|set_fullscreen` 实现为空函数，且 WebView 对非 video
-     *   元素不回调 onShowCustomView；
-     * - 导出文件名：polyfill 用 `prompt()` 询问文件名，而 WebView 不响应 prompt 恒返回 null，
-     *   游戏拿不到名字，导出时只能退化为默认名。
-     *
-     * 这里包装相关通道，把网页的意图转发给原生处理。
+     * 把 gp-next 相对路径解析为 filesDir 下的真实文件。
+     * 越界或非法输入一律收敛到数据根目录，避免逃逸到 filesDir 的其他位置。
      */
-    private val gameBridgeHookJs = """
-(function() {
-    if (window.__gdHooked) return;
-    window.__gdHooked = true;
-
-    var bridge = window.GardendlessBridge;
-
-    // 游戏启动时（约 2s）会按自己内部状态同步一次 setFullscreen(false)，
-    // 那会把我们从 SharedPreferences 恢复的全屏状态冲掉。
-    // 故在启动保护期内忽略这条自动同步的 false；true 一律放行，不影响用户主动操作。
-    var bootGuard = true;
-    setTimeout(function() { bootGuard = false; }, 6000);
-
-    var setFullscreen = function(v) {
-        if (bootGuard && !v) { bootGuard = false; return; }
-        bootGuard = false;
-        try { bridge.setFullscreen(!!v); } catch (e) { /* 桥不可用时静默降级 */ }
-    };
-
-    var setExportName = function(name) {
-        if (!name) return;
-        try { bridge.setExportName(String(name)); } catch (e) { /* 忽略 */ }
-    };
-
-    // 下载命名：游戏用 <a download="名字" href="data:..."> + click() 触发导出，
-    // 文件名只存在于 a.download 上，不会传给原生，故在此捕获
-    var isDataHref = function(el) {
-        return (el && el.getAttribute && (el.getAttribute('href') || '').indexOf('data:') === 0);
-    };
-    var origClick = HTMLAnchorElement.prototype.click;
-    HTMLAnchorElement.prototype.click = function() {
-        if (this.download && isDataHref(this)) setExportName(this.download);
-        return origClick.apply(this, arguments);
-    };
-    document.addEventListener('click', function(e) {
-        var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
-        if (a && isDataHref(a)) setExportName(a.getAttribute('download'));
-    }, true);
-
-    // 标准 Fullscreen API（游戏若改用此路径也能覆盖）
-    var ep = Element.prototype;
-    var req = ep.requestFullscreen || ep.webkitRequestFullscreen || ep.webkitRequestFullScreen;
-    if (req) {
-        ep.requestFullscreen = function() { setFullscreen(true); return req.apply(this, arguments); };
-    }
-    var dp = Document.prototype;
-    var exit = dp.exitFullscreen || dp.webkitExitFullscreen || dp.webkitCancelFullScreen;
-    if (exit) {
-        dp.exitFullscreen = function() { setFullscreen(false); return exit.apply(this, arguments); };
+    private fun gpNextFile(rawPath: String): File {
+        val root = gpNextDir.canonicalFile
+        val rootPrefix = root.path + File.separator
+        val filesPrefix = filesDir.absolutePath.replace('\\', '/').trimEnd('/') + '/'
+        val normalized = rawPath.replace('\\', '/').trimStart('/')
+        // 游戏可能传入已拼接 base path 的绝对路径，先还原为相对形式
+        val relative =
+            if (normalized.startsWith(filesPrefix)) normalized.removePrefix(filesPrefix) else normalized
+        val candidate = File(filesDir, relative).canonicalFile
+        return if (candidate.path == root.path || candidate.path.startsWith(rootPrefix)) candidate else root
     }
 
-    // Tauri invoke：游戏实际走这条
-    var patchTauri = function() {
-        var ti = window.__TAURI_INTERNALS__;
-        if (!ti || !ti.invoke || ti.__gdHooked) return false;
-        ti.__gdHooked = true;
-        var orig = ti.invoke;
-        ti.invoke = function(cmd, args) {
-            if (cmd === 'plugin:window|set_fullscreen') {
-                setFullscreen(!!(args && args.value));
-                return Promise.resolve(null);
-            }
-            if (cmd === 'plugin:dialog|save') {
-                // 游戏请求一个保存文件名。原生记下它，随后用它作为保存对话框的默认名，
-                // 与游戏自身的命名规则（存档、键位配置等各不相同）保持一致。
-                var raw = args && (args.defaultPath || (args.options && args.options.defaultPath));
-                var name = raw ? String(raw).split(/[\\/]/).pop() : '';
-                if (name) {
-                    setExportName(name);
-                    return Promise.resolve(name);
-                }
-            }
-            return orig.apply(this, arguments);
-        };
-        return true;
-    };
-
-    // polyfill 在 head 中同步执行，可能晚于本脚本，短暂轮询等待
-    if (!patchTauri()) {
-        var tries = 0;
-        var timer = setInterval(function() {
-            if (patchTauri() || ++tries > 100) clearInterval(timer);
-        }, 50);
+    /**
+     * 返回 [{name, isFile, isDirectory, isSymlink}] 形式的 JSON；目录不存在时返回空数组。
+     */
+    private fun gpNextReadDir(rawPath: String): String {
+        val entries = JSONArray()
+        gpNextFile(rawPath).listFiles()?.forEach { file ->
+            entries.put(JSONObject().apply {
+                put("name", file.name)
+                put("isFile", file.isFile)
+                put("isDirectory", file.isDirectory)
+                // 内部存储不涉及符号链接，固定为 false；需要真实判断时见 gpNextStatJson
+                put("isSymlink", false)
+            })
+        }
+        return entries.toString()
     }
-})();
-    """.trimIndent()
+
+    /** mkdirs() 在目录已存在时返回 false，因此以 isDirectory 判断最终结果 */
+    private fun gpNextMkdir(rawPath: String): Boolean {
+        val dir = gpNextFile(rawPath)
+        dir.mkdirs()
+        return dir.isDirectory
+    }
+
+    /** 写入文本，父目录不存在时自动创建 */
+    private fun gpNextWriteText(rawPath: String, text: String): Boolean = runCatching {
+        val file = gpNextFile(rawPath)
+        file.parentFile?.mkdirs()
+        file.writeText(text, Charsets.UTF_8)
+    }.isSuccess
+
+    private fun gpNextRemove(rawPath: String): Boolean {
+        val file = gpNextFile(rawPath)
+        // 仅用于清理 __gpn_edits，禁止删除数据根
+        if (file.canonicalFile == gpNextDir.canonicalFile) return false
+        return file.deleteRecursively()
+    }
+
+    /**
+     * 生成 stat / lstat 的结果，字段与 @tauri-apps/plugin-fs 的 FileInfo 一致。
+     * dist-js 会逐字段读取，其中 mtime/atime 必须是毫秒时间戳或 null，且字段不可缺失。
+     * 使用 Os.lstat 而非 File，以便识别符号链接——新版包快照会拒绝含符号链接的包。
+     * 路径不存在时返回 null，由调用方转换为 reject，与 Tauri 的 stat 失败语义一致。
+     */
+    private fun gpNextStatJson(rawPath: String): String? = runCatching {
+        val file = gpNextFile(rawPath)
+        val st = Os.lstat(file.absolutePath)
+        val type = st.st_mode and OsConstants.S_IFMT
+        JSONObject().apply {
+            put("isFile", type == OsConstants.S_IFREG)
+            put("isDirectory", type == OsConstants.S_IFDIR)
+            put("isSymlink", type == OsConstants.S_IFLNK)
+            put("size", st.st_size)
+            // Os.lstat 返回秒，而 FileInfo 使用毫秒
+            put("mtime", st.st_mtime * 1000L)
+            put("atime", st.st_atime * 1000L)
+            // Android 无法获取 birthtime，此处以 ctime 近似
+            put("birthtime", st.st_ctime * 1000L)
+            put("readonly", !file.canWrite())
+            put("fileAttributes", 0)
+            put("dev", st.st_dev)
+            put("ino", st.st_ino)
+            put("mode", st.st_mode)
+            put("nlink", st.st_nlink)
+            put("uid", st.st_uid)
+            put("gid", st.st_gid)
+            put("rdev", st.st_rdev)
+            put("blksize", st.st_blksize)
+            put("blocks", st.st_blocks)
+        }.toString()
+    }.getOrNull()
+
+    /** 重命名；源文件不存在，或任一参数指向数据根时返回 false */
+    private fun gpNextRename(oldRawPath: String, newRawPath: String): Boolean {
+        val src = gpNextFile(oldRawPath)
+        if (!src.exists()) return false
+        val dst = gpNextFile(newRawPath)
+        if (src.canonicalFile == gpNextDir.canonicalFile || dst.canonicalFile == gpNextDir.canonicalFile) {
+            return false
+        }
+        dst.parentFile?.mkdirs()
+        return src.renameTo(dst)
+    }
+
+    /** 写入二进制内容（以 base64 传入），父目录不存在时自动创建 */
+    private fun gpNextWriteBytes(rawPath: String, base64: String): Boolean = runCatching {
+        val file = gpNextFile(rawPath)
+        file.parentFile?.mkdirs()
+        file.writeBytes(Base64.decode(base64, Base64.DEFAULT))
+    }.isSuccess
+
+    /**
+     * 以系统文件管理器打开 gp-next 数据目录（即 DocumentsProvider 的 gpnext 根）。
+     * 对应游戏 patcher 页的「打开补丁文件夹」。
+     */
+    private fun openGpNextFolder() {
+        val authority = "$packageName.documents"
+        val rootUri = DocumentsContract.buildRootUri(authority, GameDocumentsProvider.GP_NEXT_ROOT_ID)
+        val initialUri =
+            DocumentsContract.buildDocumentUri(authority, "${GameDocumentsProvider.GP_NEXT_ROOT_ID}:")
+        val intent = Intent(Intent.ACTION_VIEW)
+            .addCategory(Intent.CATEGORY_DEFAULT)
+            .setDataAndType(rootUri, DocumentsContract.Root.MIME_TYPE_ITEM)
+            .putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialUri)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "无法打开 gp-next 数据目录", e)
+            Toast.makeText(this, R.string.documents_open_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
 
     /**
      * 切换 WebView 满屏 / 比例适配，并持久化该状态供下次启动沿用。

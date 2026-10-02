@@ -7,6 +7,9 @@
     <!-- Documents Provider -->
     <string name="documents_root_title">Gardendless</string>
     <string name="documents_root_summary">Game files</string>
+    <string name="documents_gpnext_root_title">GP-Next</string>
+    <string name="documents_gpnext_root_summary">Datapacks and JS mods</string>
+    <string name="documents_open_failed">No file manager available</string>
     <string name="documents_error_delete_root">Cannot delete the game directory itself</string>
     <string name="documents_error_target_exists">A file with that name already exists</string>
     <string name="documents_error_rename_failed">Rename failed</string>

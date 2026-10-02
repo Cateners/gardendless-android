@@ -39,7 +39,7 @@ class AspectRatioFrameLayout @JvmOverloads constructor(
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
 
-        // 防空保护：确保有子 View 才进行自定义测量
+        // 没有子 View 时无需自定义测量
         val child = getChildAt(0) ?: return
 
         val screenWidth = measuredWidth
@@ -50,20 +50,18 @@ class AspectRatioFrameLayout @JvmOverloads constructor(
         if (!fullscreen) {
             when {
                 screenWidth * MAX_ASPECT_H > screenHeight * MAX_ASPECT_W -> {
-                    // 1. 屏幕【太宽】了：超过 17:9（例如 20:9、21:9 手机）
-                    // 以高度为基准，宽度卡死在 17:9，左右留黑边
+                    // 宽于 17:9（如 20:9、21:9 手机）：以高度为基准，宽度限制在 17:9，左右留黑边
                     targetWidth = screenHeight * MAX_ASPECT_W / MAX_ASPECT_H
                 }
                 screenWidth * MIN_ASPECT_H < screenHeight * MIN_ASPECT_W -> {
-                    // 2. 屏幕【太方/太高】了：窄于 16:10（例如 4:3、7:5 平板）
-                    // 以宽度为基准，高度卡死在 16:10，上下留黑边
+                    // 窄于 16:10（如 4:3、7:5 平板）：以宽度为基准，高度限制在 16:10，上下留黑边
                     targetHeight = screenWidth * MIN_ASPECT_H / MIN_ASPECT_W
                 }
-                // 3. 比例在 16:10 ~ 17:9 之间：全屏铺满
+                // 比例处于 16:10 ~ 17:9 之间：铺满容器
             }
         }
 
-        // 强制指定子 View (WebView) 的精确测量尺寸
+        // 以精确尺寸测量子 View
         child.measure(
             MeasureSpec.makeMeasureSpec(targetWidth, MeasureSpec.EXACTLY),
             MeasureSpec.makeMeasureSpec(targetHeight, MeasureSpec.EXACTLY)
@@ -71,10 +69,11 @@ class AspectRatioFrameLayout @JvmOverloads constructor(
     }
 
     private companion object {
-        // 允许的最宽比例 17:9
+        /** 允许的最宽比例 17:9 */
         const val MAX_ASPECT_W = 171
         const val MAX_ASPECT_H = 90
-        // 允许的最窄比例 16:10
+
+        /** 允许的最窄比例 16:10 */
         const val MIN_ASPECT_W = 160
         const val MIN_ASPECT_H = 100
     }
