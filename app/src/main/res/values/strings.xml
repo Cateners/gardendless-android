@@ -1,6 +1,7 @@
 <resources>
     <string name="app_name">Gardendless</string>
     <string name="unzipping">Extracting files…</string>
+    <string name="extract_failed">Failed to extract game files. Please restart the app.</string>
     <string name="export_done">Exported</string>
     <string name="export_failed">Export failed</string>
 

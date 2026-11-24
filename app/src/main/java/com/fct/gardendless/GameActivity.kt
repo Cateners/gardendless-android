@@ -43,6 +43,11 @@ import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.security.MessageDigest
 import java.util.zip.ZipInputStream
 import androidx.core.net.toUri
 import org.json.JSONArray
@@ -63,17 +68,93 @@ class GameActivity : AppCompatActivity() {
     private val gpNextDir: File by lazy { File(filesDir, GP_NEXT_DIR_NAME).apply { mkdirs() } }
 
     /**
-     * 注入页面的 Tauri shim（assets/gdnext-shim.js）。
-     * 前置的 window.__gdForceJsModding 供 shim 决定是否自动启用 JS Modding，见 [FORCE_JS_MODDING]。
+     * 注入页面的脚本，按顺序拼接后一次性求值，保证执行次序。
+     *
+     * 1. assets/tauri-polyfill.js —— 模拟 Tauri 运行时。游戏包 0.16 起不再内联它，
+     *    缺少时 game 会判定 `isTauri` 为假并把窗口对象置空，所有 Tauri 命令（含全屏）失效。
+     * 2. assets/gdnext-shim.js —— 包装 invoke，把 plugin:fs|* 等命令改路由到原生。
+     *    必须排在 polyfill 之后，否则没有可包装的 invoke。
      */
-    private val gpNextShimJs: String by lazy {
-        val js = runCatching {
-            assets.open(SHIM_ASSET).bufferedReader(Charsets.UTF_8).use { it.readText() }
+    private val injectedPageJs: String by lazy {
+        listOf(
+            readAsset(TAURI_POLYFILL_ASSET),
+            readAsset(SHIM_ASSET)
+                ?.let { "window.__gdForceJsModding=$FORCE_JS_MODDING;\n$it" }
+        ).filterNotNull().joinToString("\n")
+    }
+
+    private fun readAsset(name: String): String? = runCatching {
+        assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }.getOrElse { e ->
+        Log.e(TAG, "无法读取 $name，相关功能将不可用", e)
+        null
+    }
+
+    /**
+     * 计算内置游戏包的内容指纹：压缩包长度 + 首尾各 64KB 的 SHA-256。
+     *
+     * 游戏包有 180MB+，每次启动完整读取会明显拖慢冷启动；而 APK 内的 asset 未被压缩时
+     * 可直接定位读写，成本降到毫秒级。若 openFd 不可用（asset 被压缩）或长度未知，
+     * 退回全量 SHA-256，保证不会漏掉更新。
+     */
+    private fun computeGameAssetFingerprint(): String? {
+        // 优先：直接定位首尾取样
+        val sampled = runCatching {
+            assets.openFd(GAME_ZIP_ASSET).use { afd ->
+                require(afd.length > 0) { "asset length unknown" }
+                val digest = MessageDigest.getInstance("SHA-256")
+                digest.update(ByteBuffer.allocate(8).putLong(afd.length).array())
+                FileInputStream(afd.fileDescriptor).use { fis ->
+                    val channel = fis.channel
+                    digest.update(readAt(channel, afd.startOffset, FINGERPRINT_SAMPLE_BYTES))
+                    val tailPos = (afd.startOffset + afd.length - FINGERPRINT_SAMPLE_BYTES)
+                        .coerceAtLeast(afd.startOffset)
+                    digest.update(readAt(channel, tailPos, FINGERPRINT_SAMPLE_BYTES))
+                }
+                digest.digest().toHex()
+            }
+        }.getOrNull()
+
+        if (sampled != null) return sampled
+
+        // 回退：全量计算
+        return runCatching {
+            assets.open(GAME_ZIP_ASSET).use { input ->
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    digest.update(buffer, 0, read)
+                }
+                digest.digest().toHex()
+            }
         }.getOrElse { e ->
-            Log.e(TAG, "无法读取 $SHIM_ASSET，gp-next 的数据包与 JS 模组将不可用", e)
-            ""
+            Log.e(TAG, "无法计算游戏包指纹", e)
+            null
         }
-        if (js.isEmpty()) js else "window.__gdForceJsModding=$FORCE_JS_MODDING;\n$js"
+    }
+
+    private fun readAt(channel: FileChannel, position: Long, size: Int): ByteArray {
+        val buffer = ByteBuffer.allocate(size)
+        channel.position(position)
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer) < 0) break
+        }
+        return buffer.array().copyOf(buffer.position())
+    }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    /**
+     * 在 HTML 的 `<head>` 起始处插入内容，使其先于页面内所有脚本执行。
+     * 用字符串拼接而非 replace，避免脚本里的 `$` 被当作替换模式。
+     */
+    private fun injectIntoHead(html: String, snippet: String): String {
+        val idx = html.indexOf("<head>", ignoreCase = true)
+        if (idx < 0) return html
+        val insertAt = idx + "<head>".length
+        return html.substring(0, insertAt) + snippet + html.substring(insertAt)
     }
 
     private val FILE_CHOOSER_RESULT_CODE = 101
@@ -92,8 +173,19 @@ class GameActivity : AppCompatActivity() {
     private companion object {
         const val PREF_FULLSCREEN = "webview_fullscreen"
         const val TAG = "Gardendless"
+        const val TAURI_POLYFILL_ASSET = "tauri-polyfill.js"
         const val SHIM_ASSET = "gdnext-shim.js"
         const val GP_NEXT_DIR_NAME = "gp-next"
+
+        /** 内置游戏包与其解压根目录 */
+        const val GAME_ZIP_ASSET = "pvzge_web-master.zip"
+        const val GAME_ROOT_NAME = "pvzge_web-master"
+
+        /** 记录内置游戏包内容的指纹，取代原先依赖 versionCode 的判断 */
+        const val PREF_GAME_FINGERPRINT = "game_asset_fingerprint"
+
+        /** 指纹取样长度：首尾各取一段，避免每次启动完整读取 180MB+ 的压缩包 */
+        const val FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 
         /**
          * 是否在启动时自动启用 gp-next 的 JS Modding 开关。
@@ -104,7 +196,7 @@ class GameActivity : AppCompatActivity() {
          *
          * 置为 false 可恢复原行为（需手动从 devtools 开启）。
          */
-        const val FORCE_JS_MODDING = true
+        const val FORCE_JS_MODDING = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -178,6 +270,15 @@ class GameActivity : AppCompatActivity() {
                     webView.post { setWebviewFullscreen(value) }
                 }
 
+                /**
+                 * 供 `plugin:window|is_fullscreen` 查询真实状态。
+                 * WebView 对非 video 元素不会进入 DOM 全屏，document.fullscreenElement 恒为 null，
+                 * 若沿用它游戏会永远认为自己不在全屏，从而只发进入、不发退出。
+                 */
+                @JavascriptInterface
+                fun isFullscreen(): Boolean =
+                    if (::aspectContainer.isInitialized) aspectContainer.fullscreen else false
+
                 @JavascriptInterface
                 fun setExportName(name: String) {
                     pendingExportName = name
@@ -230,29 +331,34 @@ class GameActivity : AppCompatActivity() {
                 fun openDataFolder() {
                     webView.post { openGpNextFolder() }
                 }
+
+                /**
+                 * 导出入口之二：游戏在 Tauri 环境下先 `dialog.save` 取文件名、
+                 * 再 `fs.writeTextFile` 写入。shim 让 dialog.save 返回虚拟路径，
+                 * 待 write_text_file 命中该路径时转到这里，直接弹系统保存对话框。
+                 */
+                @JavascriptInterface
+                fun exportText(name: String, content: String) {
+                    Log.e(TAG, "[export] exportText name=$name len=${content.length}")
+                    webView.post {
+                        beginExportSave(content.toByteArray(Charsets.UTF_8), name, "application/json")
+                    }
+                }
             }, "GardendlessBridge")
 
+            // 导出入口之一：游戏走浏览器路径时，以 <a download href="data:..."> 触发下载
             webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
                 if (!url.startsWith("data:")) return@setDownloadListener
 
                 // 解析 Data URI（形如 data:application/json;base64,XXXXX）
                 val parts = url.split(",")
                 if (parts.size < 2) return@setDownloadListener
-                pendingExport = Uri.decode(parts.subList(1, parts.size).joinToString(",")).toByteArray()
+                val bytes = Uri.decode(parts.subList(1, parts.size).joinToString(",")).toByteArray()
 
-                // 交由系统保存对话框决定位置与文件名
                 val fallbackType = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
                 val name = pendingExportName ?: suggestFileName(contentDisposition, fallbackType)
                 pendingExportName = null
-                // 文件名通常已自带扩展名（由游戏给出），mime 必须与之匹配，
-                // 否则 SAF 会按 mime 再追加一个后缀（例如 .json 变成 .json.txt）
-                val type = mimeFromExtension(name) ?: fallbackType
-                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                    this.type = type
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    putExtra(Intent.EXTRA_TITLE, name)
-                }
-                startActivityForResult(intent, EXPORT_SAVE_RESULT_CODE)
+                beginExportSave(bytes, name, fallbackType)
             }
 
             webView.webViewClient = object : WebViewClient() {
@@ -275,13 +381,11 @@ class GameActivity : AppCompatActivity() {
                     }
                 }
                 /**
-                 * 注入 gp-next shim，并在游戏启动后屏蔽 GameCanvas 上的触摸事件
+                 * 在游戏启动后屏蔽 GameCanvas 上的触摸事件
                  * （触摸手势统一由 MouseGameWebView 转换为鼠标事件处理）。
-                 * 页面每次加载都会重新注入，shim 内部以 __gdHooked 保证幂等。
                  */
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    if (gpNextShimJs.isNotEmpty()) view?.evaluateJavascript(gpNextShimJs, null)
                     val js = """
 (function() {
     const target = document.getElementById("GameCanvas");
@@ -312,7 +416,20 @@ class GameActivity : AppCompatActivity() {
                     request: WebResourceRequest
                 ): WebResourceResponse? {
                     // 交由 AssetLoader 解析（游戏资源与 /gp-next/ 虚拟路径）
-                    return assetLoader.shouldInterceptRequest(request.url)
+                    val response = assetLoader.shouldInterceptRequest(request.url) ?: return null
+
+                    // 入口页内联注入 polyfill + shim：游戏在模块顶层求值 isTauri，
+                    // 必须早于任何脚本执行，evaluateJavascript 的时机无法保证
+                    val path = request.url.path ?: return response
+                    if (path != "/" && !path.endsWith("/index.html")) return response
+
+                    val html = response.data?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: return response
+                    Log.e(TAG, "[inject] index.html len=${html.length} injectedLen=${injectedPageJs.length}")
+                    val injected = injectIntoHead(html, "<script>\n$injectedPageJs\n</script>")
+                    return WebResourceResponse(
+                        response.mimeType ?: "text/html", "UTF-8", injected.byteInputStream()
+                    )
                 }
             }
             webView.webChromeClient = object : WebChromeClient() {
@@ -347,6 +464,11 @@ class GameActivity : AppCompatActivity() {
                     return true
                 }
 
+                override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                    Log.e("WebViewJS", message.message())
+                    return true
+                }
+
                 // 网页调用 element.requestFullscreen() 时触发
                 override fun onShowCustomView(view: View, callback: CustomViewCallback) {
                     if (fullscreenCallback != null) {
@@ -374,8 +496,8 @@ class GameActivity : AppCompatActivity() {
             setupBackNavigation()
         }
 
-        /** 首次安装或版本号变化时，把 assets 中的游戏包解压到 filesDir */
-        fun checkAndExtractAssets(currentVersion: Int) {
+        /** 把 assets 中的游戏包解压到 filesDir（调用前已确认内容与已解压的不一致） */
+        fun checkAndExtractAssets(fingerprint: String?) {
             val progressBar = ProgressBar(this).apply {
                 // 解压总时长不可预知，使用不确定模式
                 isIndeterminate = true
@@ -394,46 +516,76 @@ class GameActivity : AppCompatActivity() {
 
             // 解压在 IO 线程执行，完成后再回主线程启动 WebView
             GlobalScope.launch(Dispatchers.IO) {
+                val gameRoot = File(filesDir, GAME_ROOT_NAME)
                 try {
-                    assets.open("pvzge_web-master.zip").use { inputStream ->
+                    // 先清空旧包：新包可能删除了某些文件，直接覆盖会留下失效残留。
+                    // 目录不存在（首次安装）时 deleteRecursively 会返回 false，故先判存在性
+                    if (gameRoot.exists() && !gameRoot.deleteRecursively()) {
+                        throw IOException("无法清理旧游戏包: ${gameRoot.absolutePath}")
+                    }
+
+                    assets.open(GAME_ZIP_ASSET).use { inputStream ->
                         ZipInputStream(inputStream).use { zis ->
                             var entry = zis.nextEntry
                             while (entry != null) {
-                                val file = File(filesDir, entry.name)
+                                val target = File(filesDir, entry.name).canonicalFile
+                                // 防 zip slip：条目不得逃逸出 filesDir
+                                if (!target.path.startsWith(filesDir.canonicalPath + File.separator)) {
+                                    throw IOException("非法条目: ${entry.name}")
+                                }
                                 if (entry.isDirectory) {
-                                    file.mkdirs()
+                                    target.mkdirs()
                                 } else {
-                                    file.parentFile?.mkdirs()
-                                    file.outputStream().use { zis.copyTo(it) }
+                                    target.parentFile?.mkdirs()
+                                    target.outputStream().use { zis.copyTo(it) }
                                 }
                                 entry = zis.nextEntry
                             }
                         }
                     }
 
-                    // 记录已解压版本，后续启动可直接跳过解压
-                    prefs.edit().putInt("extracted_version", currentVersion).apply()
+                    // 仅在完整解压成功后记录指纹；中途失败则下次启动仍会重试
+                    fingerprint?.let {
+                        prefs.edit().putString(PREF_GAME_FINGERPRINT, it).apply()
+                    }
 
                     withContext(Dispatchers.Main) {
                         dialog.dismiss()
                         setupWebview()
                     }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.e(TAG, "游戏包解压失败", e)
                     withContext(Dispatchers.Main) {
                         dialog.dismiss()
+                        MaterialAlertDialogBuilder(this@GameActivity)
+                            .setTitle(R.string.hint)
+                            .setMessage(R.string.extract_failed)
+                            .setPositiveButton(R.string.yes) { _, _ -> finish() }
+                            .show()
                     }
                 }
             }
         }
 
-        // 游戏包版本变化（含首次安装）时重新解压
-        val currentVersion = packageManager.getPackageInfo(packageName, 0).versionCode
+        // 是否需要解压只看内置压缩包内容，与 APK 版本号无关
+        GlobalScope.launch(Dispatchers.IO) {
+            val fingerprint = computeGameAssetFingerprint()
+            val installed = prefs.getString(PREF_GAME_FINGERPRINT, null)
+            val gameRoot = File(filesDir, GAME_ROOT_NAME)
 
-        if (prefs.getInt("extracted_version", 0) != currentVersion) {
-            checkAndExtractAssets(currentVersion)
-        } else {
-            setupWebview()
+            val needExtract = when {
+                // 指纹不可用（asset 异常）时，已有游戏包就沿用，避免每次启动重复解压
+                fingerprint == null -> !gameRoot.exists()
+                else -> fingerprint != installed
+            }
+
+            withContext(Dispatchers.Main) {
+                if (needExtract) {
+                    checkAndExtractAssets(fingerprint)
+                } else {
+                    setupWebview()
+                }
+            }
         }
     }
 
@@ -461,6 +613,25 @@ class GameActivity : AppCompatActivity() {
                 if (bytes != null && uri != null) saveExportTo(uri, bytes)
             }
         }
+    }
+
+    /**
+     * 弹出系统保存对话框。
+     *
+     * 文件名通常已自带扩展名（由游戏给出），mime 必须与之匹配，
+     * 否则 SAF 会按 mime 再追加一个后缀（例如 .json 变成 .json.txt）。
+     */
+    private fun beginExportSave(bytes: ByteArray, name: String, fallbackMime: String?) {
+        pendingExport = bytes
+        val type = mimeFromExtension(name)
+            ?: fallbackMime?.takeIf { it.isNotBlank() }
+            ?: "application/octet-stream"
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            this.type = type
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_TITLE, name)
+        }
+        startActivityForResult(intent, EXPORT_SAVE_RESULT_CODE)
     }
 
     private fun saveExportTo(uri: Uri, bytes: ByteArray) {

@@ -29,6 +29,7 @@ class AspectRatioFrameLayout @JvmOverloads constructor(
 ) : FrameLayout(context, attrs) {
 
     /** true：子 View 铺满容器；false：按 16:10 ~ 17:9 约束 */
+    @Volatile
     var fullscreen: Boolean = false
         set(value) {
             if (field == value) return

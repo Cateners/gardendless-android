@@ -2,6 +2,7 @@
 <resources>
     <string name="app_name">Gardendless</string>
     <string name="unzipping">解压资源中…</string>
+    <string name="extract_failed">游戏包解压失败，请重启应用重试</string>
     <string name="export_done">已导出</string>
     <string name="export_failed">导出失败</string>
 

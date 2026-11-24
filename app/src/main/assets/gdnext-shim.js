@@ -247,6 +247,7 @@
                 var headers = (options && options.headers) || {};
                 var path = headers.path ? decodeURIComponent(headers.path) : (args && args.path);
                 if (!path) throw new Error('write_text_file requires a path');
+
                 if (!bridge.fsWriteText(relPath(path), bodyToText(body))) {
                     throw new Error('write_text_file failed: ' + path);
                 }
@@ -261,7 +262,7 @@
         return null;
     }
 
-    // 本脚本接管的命令：全部 plugin:fs|* 以及以下两个精确匹配项
+    // 本脚本接管的命令：全部 plugin:fs|* 以及以下精确匹配项
     var HANDLED = /^plugin:fs\|/;
     var HANDLED_EXACT = ['plugin:path|resolve_directory', 'plugin:opener|open_path'];
 
@@ -291,6 +292,16 @@
                 setFullscreen(!!(args && args.value));
                 return Promise.resolve(null);
             }
+
+            // 不能沿用 polyfill 的 document.fullscreenElement：WebView 对非 video 元素
+            // 不会进入 DOM 全屏，它会恒为 null，导致游戏永远认为自己不在全屏、只进不退。
+            if (name === 'plugin:window|is_fullscreen') {
+                var isFs = false;
+                try { isFs = !!bridge.isFullscreen(); } catch (e) { /* 桥不可用时保持 false */ }
+                return Promise.resolve(isFs);
+            }
+
+
 
             return origInvoke.apply(this, arguments);
         };
